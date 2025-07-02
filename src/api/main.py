@@ -3,9 +3,10 @@ from pydantic import BaseModel
 import pandas as pd
 import os
 from typing import List, Dict, Union
+import joblib # To load the preprocessing pipeline
 
-# Import functions from data_processing and predict modules
-from src.data_processing import feature_engineer, preprocess_data
+# Import classes/functions from data_processing and predict modules
+from src.data_processing import CustomerAggregator, load_raw_data # We need CustomerAggregator
 from src.predict import CreditScoringPredictor
 
 # --- FastAPI App Initialization ---
@@ -15,14 +16,29 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# --- Load Model and Scaler ---
-# Define paths relative to the project root
-MODEL_DIR = './models/' # When running via Docker, current dir is project root
+# --- Load Model, Scaler, and Preprocessing Pipeline ---
+# Define paths relative to the project root (which is /app in Docker)
+MODEL_DIR = './models/'
 MODEL_PATH = os.path.join(MODEL_DIR, 'credit_risk_model.pkl')
 SCALER_PATH = os.path.join(MODEL_DIR, 'scaler.pkl')
+PREPROCESSING_PIPELINE_PATH = os.path.join(MODEL_DIR, 'preprocessing_pipeline.pkl')
 
 # Initialize the predictor globally to load model/scaler once
 predictor = CreditScoringPredictor(MODEL_PATH, SCALER_PATH)
+
+# Load the preprocessing pipeline
+preprocessing_pipeline = None
+try:
+    preprocessing_pipeline = joblib.load(PREPROCESSING_PIPELINE_PATH)
+    print(f"Preprocessing pipeline loaded successfully from {PREPROCESSING_PIPELINE_PATH}")
+except FileNotFoundError:
+    print(f"Error: Preprocessing pipeline file not found at {PREPROCESSING_PIPELINE_PATH}. "
+          "Please ensure data_processing.py has been run to create it.")
+    # In a production environment, you might want to raise an exception or exit here.
+    # For now, we'll allow the app to start but predictions will fail.
+except Exception as e:
+    print(f"Error loading preprocessing pipeline: {e}")
+
 
 # --- Pydantic Models for Request and Response ---
 class Transaction(BaseModel):
@@ -41,9 +57,7 @@ class Transaction(BaseModel):
     Value: float
     TransactionStartTime: str # Will be parsed to datetime
     PricingStrategy: int
-    # FraudResult is not expected for new transactions, but might be present in historical data
-    # For API input, we assume it's not provided or is 0 for new transactions.
-    FraudResult: int = 0 # Default to 0 for new transactions
+    FraudResult: int = 0 # Default to 0 for new transactions, as it's not an input for prediction
 
 class CreditScoreResponse(BaseModel):
     AccountId: int
@@ -74,8 +88,8 @@ async def predict_credit_score(transactions: List[Transaction]):
     Expects a list of transaction objects for one or more customers.
     The model will aggregate these transactions to derive customer-level features.
     """
-    if not predictor.model or not predictor.scaler:
-        raise HTTPException(status_code=500, detail="Model or scaler not loaded. Cannot process request.")
+    if not predictor.model or not predictor.scaler or not preprocessing_pipeline:
+        raise HTTPException(status_code=500, detail="Model, scaler, or preprocessing pipeline not loaded. Cannot process request.")
 
     # Convert list of Transaction Pydantic models to pandas DataFrame
     transactions_df = pd.DataFrame([t.dict() for t in transactions])
@@ -87,63 +101,38 @@ async def predict_credit_score(transactions: List[Transaction]):
     customer_ids = transactions_df['AccountId'].unique()
     results = []
 
-    # In a real-world scenario, you'd likely aggregate all transactions for a given customer
-    # over a defined look-back period (e.g., last 3 months) to generate features.
-    # For this example, we'll process each unique AccountId present in the input transactions.
-    # This assumes the input `transactions` list contains all relevant transactions for the
-    # customers you want to score at this moment.
-
     for account_id in customer_ids:
         customer_txns = transactions_df[transactions_df['AccountId'] == account_id].copy()
 
-        # 1. Feature Engineering (using data_processing.py logic)
-        # Note: For real-time, this needs to be robust to single/few transactions.
-        # The `feature_engineer` function currently expects a DataFrame with multiple transactions
-        # to calculate things like Frequency, Monetary, etc.
-        # For a single transaction, Frequency would be 1, Monetary would be Value, etc.
-        # It's crucial that the feature engineering logic here matches `data_processing.py`
-        # and what the model was trained on.
-
-        # For simplicity in API, let's assume `feature_engineer` can handle single-customer data.
-        # If the model was trained on aggregated customer data, the input to `predict_score_and_terms`
-        # must be in the same format.
         try:
-            customer_features_df = feature_engineer(customer_txns)
-            # Remove 'HasFraud' if it was generated, as it's the target, not an input feature for prediction
-            if 'HasFraud' in customer_features_df.columns:
-                customer_features_df = customer_features_df.drop(columns=['HasFraud'])
-            if 'AccountId' in customer_features_df.columns:
-                customer_features_df = customer_features_df.drop(columns=['AccountId'])
+            # Step 1: Feature Engineering (Aggregation) using CustomerAggregator
+            # This will create customer-level features from the provided transactions
+            # Note: CustomerAggregator expects raw transaction data.
+            customer_features_aggregated = CustomerAggregator().transform(customer_txns)
 
-            # 2. Preprocessing (one-hot encoding etc., must match training preprocessing)
-            # This is a simplified call; in a robust system, the preprocessing pipeline
-            # (including fitted encoders/scalers) would be loaded and applied.
-            # For now, we'll manually handle categorical features based on what was in data_processing.py
-            # and assume the model expects one-hot encoded features.
+            # Drop target and identifier columns from aggregated features before preprocessing
+            # These columns should not be passed to the preprocessing pipeline or model
+            features_to_drop_from_agg = ['HasFraud', 'AccountId', 'TotalFraudTransactions']
+            customer_features_for_preprocessing = customer_features_aggregated.drop(
+                columns=[col for col in features_to_drop_from_agg if col in customer_features_aggregated.columns]
+            )
 
-            # Get the expected columns from the scaler (which was fitted on X_train)
-            # A better approach is to save the column names or a preprocessing pipeline
-            # during training and load it here.
-            try:
-                # This assumes X_train.csv was saved by data_processing.py
-                X_train_cols = pd.read_csv('./data/processed/X_train.csv').columns.tolist()
-            except FileNotFoundError:
-                raise HTTPException(status_code=500, detail="X_train.csv not found. Cannot determine expected feature columns. Please ensure training data is processed and saved.")
+            # Step 2: Preprocessing using the loaded pipeline
+            # This applies imputation, scaling, and WOE encoding
+            # It's crucial that the columns in customer_features_for_preprocessing match
+            # the columns the pipeline was fitted on (X_train_agg from data_processing.py)
+            processed_features_array = preprocessing_pipeline.transform(customer_features_for_preprocessing)
 
-            # Apply one-hot encoding to the current customer's features
-            categorical_cols_to_encode = customer_features_df.select_dtypes(include='object').columns.tolist()
-            customer_features_processed = pd.get_dummies(customer_features_df, columns=categorical_cols_to_encode, drop_first=True)
+            # Convert the processed array back to a DataFrame with correct column names
+            # This is essential because the predictor expects a DataFrame with named columns
+            processed_features_df = pd.DataFrame(
+                processed_features_array,
+                columns=preprocessing_pipeline.get_feature_names_out()
+            )
 
-            # Align columns with the model's expected input features (X_train_cols)
-            # Add missing columns (from X_train_cols) and fill with 0
-            missing_cols = set(X_train_cols) - set(customer_features_processed.columns)
-            for c in missing_cols:
-                customer_features_processed[c] = 0
-            # Ensure the order of columns is the same as during training
-            customer_features_aligned = customer_features_processed[X_train_cols]
-
-            # 3. Predict Credit Score and Loan Terms
-            prediction = predictor.predict_score_and_terms(customer_features_aligned)
+            # Step 3: Predict Credit Score and Loan Terms
+            # The predictor expects a DataFrame, even if it's a single row
+            prediction = predictor.predict_score_and_terms(processed_features_df)
 
             if "error" in prediction:
                 raise HTTPException(status_code=500, detail=prediction["error"])
@@ -157,7 +146,9 @@ async def predict_credit_score(transactions: List[Transaction]):
                 interest_rate_tier=prediction['interest_rate_tier']
             ))
         except Exception as e:
+            # Log the full traceback for debugging in production
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Error processing AccountId {account_id}: {str(e)}")
 
     return results
-

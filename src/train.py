@@ -5,39 +5,89 @@ import os
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, classification_report, confusion_matrix
-from imblearn.over_sampling import SMOTE # For handling class imbalance
-from sklearn.preprocessing import StandardScaler # For scaling numerical features
 
 # Suppress warnings for cleaner output
 import warnings
 warnings.filterwarnings('ignore')
 
-def load_processed_data(file_path: str, target_column: str):
+# Custom RandomOverSampler implementation
+class RandomOverSampler:
+    def __init__(self, random_state=42):
+        self.random_state = random_state
+
+    def fit_resample(self, X, y):
+        # Identify minority and majority classes
+        unique_classes, class_counts = np.unique(y, return_counts=True)
+        if len(unique_classes) < 2:
+            print("Only one class found. No oversampling performed.")
+            return X, y
+
+        majority_class = unique_classes[np.argmax(class_counts)]
+        minority_class = unique_classes[np.argmin(class_counts)]
+        
+        majority_count = class_counts[np.argmax(class_counts)]
+        minority_count = class_counts[np.argmin(class_counts)]
+
+        # If minority class is empty, return original data
+        if minority_count == 0:
+            return X, y
+
+        # Calculate how many samples to generate
+        n_samples_to_generate = majority_count - minority_count
+
+        if n_samples_to_generate <= 0:
+            return X, y # No oversampling needed if minority is already larger or equal
+
+        # Get indices of minority class samples
+        minority_indices = np.where(y == minority_class)[0]
+        
+        # Randomly sample with replacement from minority class
+        np.random.seed(self.random_state)
+        resampled_indices = np.random.choice(minority_indices, size=n_samples_to_generate, replace=True)
+
+        # Concatenate original minority samples with generated samples
+        X_resampled_minority = X.iloc[resampled_indices]
+        y_resampled_minority = y.iloc[resampled_indices]
+
+        X_resampled = pd.concat([X, X_resampled_minority], axis=0)
+        y_resampled = pd.concat([y, y_resampled_minority], axis=0)
+
+        # Shuffle the resampled data
+        shuffled_indices = np.random.permutation(len(X_resampled))
+        X_resampled = X_resampled.iloc[shuffled_indices].reset_index(drop=True)
+        y_resampled = y_resampled.iloc[shuffled_indices].reset_index(drop=True)
+
+        return X_resampled, y_resampled
+
+
+def load_processed_data_splits(data_dir: str, target_column: str):
     """
-    Loads processed data and separates features (X) from target (y).
+    Loads processed data splits (X_train, X_test, y_train, y_test).
 
     Args:
-        file_path (str): Path to the processed CSV file.
-        target_column (str): Name of the target column.
+        data_dir (str): Directory where processed data CSVs are stored.
+        target_column (str): Name of the target column (for y_train/y_test files).
 
     Returns:
-        tuple: X (features DataFrame), y (target Series)
+        tuple: X_train, X_test, y_train, y_test DataFrames/Series.
     """
     try:
-        df = pd.read_csv(file_path)
-        X = df.drop(columns=[target_column])
-        y = df[target_column]
-        print(f"Processed data loaded from {file_path}")
-        return X, y
+        X_train = pd.read_csv(os.path.join(data_dir, 'X_train_processed.csv'))
+        X_test = pd.read_csv(os.path.join(data_dir, 'X_test_processed.csv'))
+        y_train = pd.read_csv(os.path.join(data_dir, 'y_train.csv')).squeeze() # .squeeze() to convert DataFrame to Series
+        y_test = pd.read_csv(os.path.join(data_dir, 'y_test.csv')).squeeze()
+        print(f"Processed data splits loaded successfully from {data_dir}")
+        return X_train, X_test, y_train, y_test
     except FileNotFoundError:
-        print(f"Error: Processed data file not found at {file_path}. Please run data_processing.py first.")
-        # Create dummy data for demonstration if file is not found
+        print(f"Error: Processed data files not found in {data_dir}. Please run data_processing.py first.")
+        # Create dummy data for demonstration if files are not found
         print("Creating dummy data for training script demonstration.")
         num_samples = 1000
-        X_dummy = pd.DataFrame(np.random.rand(num_samples, 10), columns=[f'feature_{i}' for i in range(10)])
-        X_dummy['MostFrequentChannel_Web'] = np.random.randint(0, 2, num_samples) # Example OHE feature
+        # Ensure dummy data matches expected processed feature structure (e.g., num__ and cat__ prefixes)
+        X_dummy = pd.DataFrame(np.random.rand(num_samples, 20), columns=[f'num__feature_{i}' for i in range(10)] + [f'cat__feature_{i}' for i in range(10)])
         y_dummy = pd.Series(np.random.choice([0, 1], num_samples, p=[0.95, 0.05]), name=target_column)
-        return X_dummy, y_dummy
+        X_train, X_test, y_train, y_test = train_test_split(X_dummy, y_dummy, test_size=0.2, random_state=42, stratify=y_dummy)
+        return X_train, X_test, y_train, y_test
 
 
 def train_model(X_train: pd.DataFrame, y_train: pd.Series, model_type: str = 'logistic_regression'):
@@ -45,39 +95,28 @@ def train_model(X_train: pd.DataFrame, y_train: pd.Series, model_type: str = 'lo
     Trains the credit risk model.
 
     Args:
-        X_train (pd.DataFrame): Training features.
+        X_train (pd.DataFrame): Training features (already preprocessed by data_processing.py).
         y_train (pd.Series): Training target.
         model_type (str): Type of model to train ('logistic_regression' or 'gradient_boosting').
 
     Returns:
         sklearn.base.BaseEstimator: The trained model.
-        sklearn.preprocessing.StandardScaler: The fitted scaler.
     """
     print(f"Training {model_type} model...")
 
-    # Scale numerical features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns)
-
-    # Handle class imbalance using SMOTE
-    # Only apply SMOTE if there's a minority class to oversample
-    if y_train.value_counts()[1] > 0 and y_train.value_counts()[0] > 0:
-        print("Applying SMOTE for class imbalance...")
-        smote = SMOTE(random_state=42)
-        X_train_resampled, y_train_resampled = smote.fit_resample(X_train_scaled, y_train)
-        print(f"Original class distribution: {y_train.value_counts()}")
-        print(f"Resampled class distribution: {y_train_resampled.value_counts()}")
-    else:
-        X_train_resampled, y_train_resampled = X_train_scaled, y_train
-        print("SMOTE not applied (no imbalance or only one class).")
+    # Handle class imbalance using custom RandomOverSampler
+    print("Applying RandomOverSampler for class imbalance...")
+    ros = RandomOverSampler(random_state=42)
+    X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
+    print(f"Original class distribution: {y_train.value_counts()}")
+    print(f"Resampled class distribution: {y_train_resampled.value_counts()}")
 
 
     if model_type == 'logistic_regression':
-        model = LogisticRegression(solver='liblinear', random_state=42, class_weight='balanced') # 'balanced' can also help
+        # Using class_weight='balanced' in LogisticRegression is a good alternative/complement to SMOTE
+        # It automatically adjusts weights inversely proportional to class frequencies.
+        model = LogisticRegression(solver='liblinear', random_state=42, class_weight='balanced', max_iter=1000)
     elif model_type == 'gradient_boosting':
-        # Using a simple GradientBoostingClassifier from sklearn for demonstration
-        # In a real scenario, consider XGBoost or LightGBM for better performance
         from sklearn.ensemble import GradientBoostingClassifier
         model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
     else:
@@ -85,26 +124,22 @@ def train_model(X_train: pd.DataFrame, y_train: pd.Series, model_type: str = 'lo
 
     model.fit(X_train_resampled, y_train_resampled)
     print(f"{model_type} model training completed.")
-    return model, scaler
+    return model
 
 
-def evaluate_model(model, scaler, X_test: pd.DataFrame, y_test: pd.Series):
+def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series):
     """
     Evaluates the trained model on the test set.
 
     Args:
         model: The trained model.
-        scaler: The fitted scaler used for preprocessing.
-        X_test (pd.DataFrame): Test features.
+        X_test (pd.DataFrame): Test features (already preprocessed).
         y_test (pd.Series): Test target.
     """
     print("Evaluating model performance...")
 
-    X_test_scaled = scaler.transform(X_test)
-    X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns)
-
-    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
-    y_pred = model.predict(X_test_scaled)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = model.predict(X_test)
 
     # ROC AUC Score
     roc_auc = roc_auc_score(y_test, y_pred_proba)
@@ -125,51 +160,40 @@ def evaluate_model(model, scaler, X_test: pd.DataFrame, y_test: pd.Series):
 
     # Cross-validation (optional, but good for robust evaluation)
     # cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    # cv_scores = cross_val_score(model, X_test_scaled, y_test, cv=cv, scoring='roc_auc')
+    # cv_scores = cross_val_score(model, X_test, y_test, cv=cv, scoring='roc_auc')
     # print(f"\nCross-validation ROC AUC scores: {cv_scores}")
     # print(f"Mean CV ROC AUC: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
 
 
-def save_model(model, scaler, model_dir: str = '../../models/'):
+def save_model(model, model_dir: str = './models/'):
     """
-    Saves the trained model and scaler.
+    Saves the trained model.
 
     Args:
         model: The trained model.
-        scaler: The fitted scaler.
         model_dir (str): Directory to save the model.
     """
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, 'credit_risk_model.pkl')
-    scaler_path = os.path.join(model_dir, 'scaler.pkl')
 
     joblib.dump(model, model_path)
-    joblib.dump(scaler, scaler_path)
     print(f"Model saved to {model_path}")
-    print(f"Scaler saved to {scaler_path}")
 
 
 if __name__ == "__main__":
-    PROCESSED_DATA_PATH = '../../data/processed/customer_features.csv'
+    PROCESSED_DATA_DIR = './data/processed/'
     TARGET_COLUMN = 'HasFraud'
-    MODEL_DIR = '../../models/'
+    MODEL_DIR = './models/'
 
-    # Load data
-    X, y = load_processed_data(PROCESSED_DATA_PATH, TARGET_COLUMN)
-
-    # Split data (re-split here to ensure consistency with training script's logic)
-    # In a real MLOps pipeline, X_train, X_test, y_train, y_test might be saved directly
-    # from data_processing.py and loaded here.
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Load preprocessed data splits
+    X_train, X_test, y_train, y_test = load_processed_data_splits(PROCESSED_DATA_DIR, TARGET_COLUMN)
 
     # Train model
     # Choose 'logistic_regression' or 'gradient_boosting'
-    trained_model, fitted_scaler = train_model(X_train, y_train, model_type='logistic_regression')
+    trained_model = train_model(X_train, y_train, model_type='logistic_regression')
 
     # Evaluate model
-    evaluate_model(trained_model, fitted_scaler, X_test, y_test)
+    evaluate_model(trained_model, X_test, y_test)
 
-    # Save model and scaler
-    save_model(trained_model, fitted_scaler, MODEL_DIR)
+    # Save model
+    save_model(trained_model, MODEL_DIR)

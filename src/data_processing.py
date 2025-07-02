@@ -9,38 +9,93 @@ from sklearn.model_selection import train_test_split
 import os
 import joblib # For saving the pipeline
 
-# Import WOETransformer from xverse
-try:
-    from xverse.transformers import WOETransformer
-except ImportError:
-    print("xverse not found. Please install it using 'pip install xverse'.")
-    print("Using a dummy WOETransformer for demonstration. This will not perform actual WOE transformation.")
-    # Dummy WOETransformer for demonstration if xverse is not installed
-    class WOETransformer(BaseEstimator, TransformerMixin):
-        def __init__(self, woe_columns=None):
-            self.woe_columns = woe_columns
-            self.woe_maps = {}
 
-        def fit(self, X, y=None):
-            if self.woe_columns is None:
-                self.woe_columns = X.select_dtypes(include='object').columns.tolist()
-            for col in self.woe_columns:
-                # Dummy WOE map: just map categories to random numbers
-                unique_categories = X[col].unique()
-                self.woe_maps[col] = {cat: np.random.rand() for cat in unique_categories}
-                # Handle potential NaN: map NaN to a specific value
-                if X[col].isnull().any():
-                    self.woe_maps[col][np.nan] = np.random.rand()
-            return self
+class WOETransformer(BaseEstimator, TransformerMixin):
+    """
+    Custom Weight of Evidence (WOE) Transformer.
+    Calculates WOE for categorical features based on the target variable.
+    Handles missing values by treating them as a separate category.
+    """
+    def __init__(self, woe_columns=None, smooth_factor=0.001):
+        self.woe_columns = woe_columns
+        self.woe_maps = {}
+        self.smooth_factor = smooth_factor # Smoothing factor to avoid division by zero
+        self.fitted_ = False
 
-        def transform(self, X):
-            X_transformed = X.copy()
-            for col in self.woe_columns:
-                if col in X_transformed.columns:
-                    # Replace missing values with a placeholder before mapping
-                    X_transformed[col] = X_transformed[col].fillna('__MISSING__')
-                    X_transformed[col] = X_transformed[col].map(self.woe_maps[col]).fillna(0) # Fill any new unseen categories with 0
-            return X_transformed
+    def fit(self, X, y):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X) # Ensure X is a DataFrame for column operations
+
+        if self.woe_columns is None:
+            # If not specified, identify all object (categorical) columns
+            self.woe_columns = X.select_dtypes(include='object').columns.tolist()
+            # Also include numerical columns that might be treated as categorical (e.g., small unique values)
+            for col in X.select_dtypes(include=np.number).columns:
+                if X[col].nunique() < 50 and X[col].dtype != 'float': # Heuristic for low cardinality numericals
+                    self.woe_columns.append(col)
+            self.woe_columns = list(set(self.woe_columns)) # Remove duplicates
+
+        for col in self.woe_columns:
+            if col not in X.columns:
+                print(f"Warning: Column '{col}' not found in X during WOETransformer fit. Skipping.")
+                continue
+
+            # Create a temporary DataFrame for WOE calculation, including target
+            temp_df = pd.DataFrame({col: X[col], 'target': y})
+
+            # Handle missing values by treating them as a distinct category
+            temp_df[col] = temp_df[col].fillna('__MISSING__')
+
+            # Calculate good and bad counts for each category
+            # 'good' are target=0, 'bad' are target=1 (assuming 0=good, 1=bad)
+            counts = temp_df.groupby(col)['target'].agg(['count', 'sum']).rename(columns={'sum': 'bad'})
+            counts['good'] = counts['count'] - counts['bad']
+
+            # Calculate total good and bad counts for the column
+            total_good = counts['good'].sum()
+            total_bad = counts['bad'].sum()
+
+            # Apply smoothing to avoid division by zero
+            counts['prop_good'] = (counts['good'] + self.smooth_factor) / (total_good + 2 * self.smooth_factor)
+            counts['prop_bad'] = (counts['bad'] + self.smooth_factor) / (total_bad + 2 * self.smooth_factor)
+
+            # Calculate WOE
+            counts['woe'] = np.log(counts['prop_good'] / counts['prop_bad'])
+
+            # Store the WOE mapping
+            self.woe_maps[col] = counts['woe'].to_dict()
+
+        self.fitted_ = True
+        return self
+
+    def transform(self, X):
+        if not self.fitted_:
+            raise RuntimeError("WOETransformer is not fitted yet. Call 'fit' before 'transform'.")
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X) # Ensure X is a DataFrame for column operations
+
+        X_transformed = X.copy()
+        for col in self.woe_columns:
+            if col in X_transformed.columns:
+                # Replace missing values with a placeholder before mapping
+                X_transformed[col] = X_transformed[col].fillna('__MISSING__')
+                # Map categories. If a category is unseen, fill with 0 (or a default WOE, e.g., mean WOE)
+                # Using 0 for unseen categories is a common practice.
+                X_transformed[col] = X_transformed[col].map(self.woe_maps.get(col, {})).fillna(0)
+            else:
+                # If a WOE column from fit is not in transform data, add it with 0s
+                X_transformed[col] = 0.0
+        return X_transformed
+
+    def get_feature_names_out(self, input_features=None):
+        """
+        Returns output feature names. For WOETransformer, the output feature names
+        are the same as the input categorical columns that were transformed.
+        """
+        if input_features is not None:
+            # Filter input_features to only include those that were WOE-transformed
+            return [f for f in input_features if f in self.woe_columns]
+        return self.woe_columns
 
 
 class CustomerAggregator(BaseEstimator, TransformerMixin):
@@ -145,6 +200,7 @@ def get_preprocessing_pipeline(numerical_cols: list, categorical_cols: list) -> 
 
     # Preprocessing for categorical features: apply Weight of Evidence (WoE) transformation
     # WOETransformer handles missing values by creating a separate bin for NaNs.
+    # It's crucial that WOETransformer can handle unseen categories or NaNs gracefully during transform.
     categorical_transformer = Pipeline(steps=[
         ('woe', WOETransformer(woe_columns=categorical_cols))
     ])
@@ -158,17 +214,6 @@ def get_preprocessing_pipeline(numerical_cols: list, categorical_cols: list) -> 
         remainder='passthrough' # Keep other columns (like AccountId, if not dropped before)
     )
 
-    # The full pipeline will look like this:
-    # 1. CustomerAggregator (custom transformer)
-    # 2. ColumnTransformer (for numerical and categorical features from aggregated data)
-
-    # We need to ensure that the ColumnTransformer gets the correct column names
-    # *after* the CustomerAggregator step.
-    # This means the pipeline needs to be defined after we know the output columns
-    # of the CustomerAggregator, or the ColumnTransformer needs to be dynamic.
-
-    # Let's simplify: the `get_preprocessing_pipeline` will operate on the output
-    # of `CustomerAggregator`. The main function will chain these.
     print("Preprocessing pipeline created.")
     return preprocessor
 
@@ -244,9 +289,9 @@ def split_data(df: pd.DataFrame, target_column: str, test_size: float = 0.2, ran
 
 
 if __name__ == "__main__":
-    RAW_DATA_PATH = '../../data/raw/data.csv'
-    PROCESSED_DATA_DIR = '../../data/processed/'
-    PIPELINE_PATH = '../../models/preprocessing_pipeline.pkl'
+    RAW_DATA_PATH = './data/raw/data.csv' # Adjusted path
+    PROCESSED_DATA_DIR = './data/processed/' # Adjusted path
+    PIPELINE_PATH = './models/preprocessing_pipeline.pkl' # Adjusted path
     TARGET_COLUMN = 'HasFraud'
 
     # Ensure directories exist
@@ -282,10 +327,12 @@ if __name__ == "__main__":
     print("Transforming training and test data...")
     X_train_processed = pd.DataFrame(
         preprocessing_pipeline.transform(X_train_agg),
+        # Call get_feature_names_out AFTER fitting the pipeline
         columns=preprocessing_pipeline.get_feature_names_out()
     )
     X_test_processed = pd.DataFrame(
         preprocessing_pipeline.transform(X_test_agg),
+        # Call get_feature_names_out AFTER fitting the pipeline
         columns=preprocessing_pipeline.get_feature_names_out()
     )
 
